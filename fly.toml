@@ -1,0 +1,65 @@
+# fly.toml app configuration file generated for z-ai-vision-mcp-fly on 2025-12-27T17:43:45Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'z-ai-vision-mcp-fly'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[deploy]
+  strategy = 'rolling'
+
+[env]
+  DEBUG_LOGGING = 'false'
+  MCP_COMMAND = 'npx -y @z_ai/mcp-server'
+  PORT = '8080'
+
+[processes]
+  web = 'node server.js'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['web']
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8080
+  processes = ['web']
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
+
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 10
+    soft_limit = 8
+
+  [[services.tcp_checks]]
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '1s'
+
+  [[services.http_checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
+    protocol = 'http'
+    tls_skip_verify = false
+
+[[vm]]
+  cpus = 1
+  memory_mb = 512

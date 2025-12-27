@@ -1,90 +1,85 @@
-# Fly.io Deployment Configuration Example
+# Fly.io Deployment Configuration for Z.AI Vision MCP Server
 # Copy this to fly.toml and configure for your deployment
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+
+app = 'your-z-ai-vision-mcp'  # Replace with your desired app name
+primary_region = 'iad'         # Choose region closest to your users
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
+
+[deploy]
+  strategy = 'rolling'
 
 [env]
-  # Server port (Fly.io sets this automatically)
-  PORT = "8080"
-  
-  # Enable debug logging in development
-  DEBUG_LOGGING = "false"
+  DEBUG_LOGGING = 'false'
+  MCP_COMMAND = 'npx -y @z_ai/mcp-server'
+  PORT = '8080'
 
-[env.production]
-  # Security: Bearer token required in production
-  BEARER_TOKEN = { required = true }
-  
-  # Debug logging off in production for performance
-  DEBUG_LOGGING = "false"
+[processes]
+  web = 'node server.js'
 
-[env.staging]
-  # Staging environment configuration
-  DEBUG_LOGGING = "true"
-
-# HTTP service configuration
-[[services]]
+[http_service]
   internal_port = 8080
-  protocol = "tcp"
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['web']
 
-  [services.concurrency]
-    hard_limit = 25
-    soft_limit = 20
-    type = "connections"
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8080
+  processes = ['web']
 
   [[services.ports]]
     port = 80
-    handlers = ["http"]
+    handlers = ['http']
 
   [[services.ports]]
     port = 443
-    handlers = ["tls", "http"]
+    handlers = ['tls', 'http']
+
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 10
+    soft_limit = 8
 
   [[services.tcp_checks]]
-    grace_period = "1s"
-    interval = "15s"
-    restart_limit = 0
-    timeout = "2s"
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '1s'
 
   [[services.http_checks]]
-    grace_period = "10s"
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    protocol = "http"
-    restart_limit = 0
-    timeout = "5s"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
+    protocol = 'http'
     tls_skip_verify = false
 
-# Process configuration
-[processes]
-  web = "node server.js"
-
-# Resource configuration
-[resources]
-  cpu = "shared"
-  memory = "512mb"
-
-# Deploy configuration
-[deploy]
-  strategy = "rolling"
-
-# Auto-scaling (optional)
-[autoscaling]
-  enabled = false
-  min_visible_instances = 1
-  max_visible_instances = 2
+[[vm]]
+  cpus = 1
+  memory_mb = 512
 
 # =============================================================================
-# DEPLOYMENT INSTRUCTIONS:
+# DEPLOYMENT INSTRUCTIONS FOR Z.AI VISION MCP SERVER:
 # =============================================================================
 # 1. Copy this file: cp fly.example.toml fly.toml
-# 2. Edit fly.toml with your specific configuration
-# 3. Set required secrets:
-#    flyctl secrets set MCP_COMMAND="npx -y @modelcontextprotocol/server-github"
+# 2. Edit fly.toml:
+#    - Set app name: app = "your-unique-app-name"
+#    - Choose region: primary_region = "iad" (or nearest to you)
+# 3. Create the Fly.io app:
+#    flyctl apps create your-unique-app-name
+# 4. Set required secrets:
 #    flyctl secrets set BEARER_TOKEN="$(openssl rand -base64 32)"
-#    flyctl secrets set GITHUB_TOKEN="ghp_your_token"
-# 4. Deploy: flyctl deploy --remote-only
-# 5. Check status: flyctl status
-# 6. View logs: flyctl logs
+#    flyctl secrets set Z_AI_API_KEY="your_z_ai_api_key"
+#    flyctl secrets set Z_AI_MODE="ZAI"  # or "ZHIPU" depending on platform
+# 5. Deploy: flyctl deploy --remote-only
+# 6. Check status: flyctl status
+# 7. View logs: flyctl logs
+# 8. Test endpoint:
+#    curl -H "Authorization: Bearer YOUR_BEARER_TOKEN" https://your-app.fly.dev/health
 # =============================================================================

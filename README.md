@@ -1,10 +1,10 @@
-# Generic MCP Server Proxy
+# Z.AI Vision MCP Server Proxy
 
-A flexible, production-ready proxy server that wraps any stdio-based MCP (Model Context Protocol) server with bearer token authentication and SSE streaming support.
+A production-ready proxy server for deploying the Z.AI Vision MCP Server on Fly.io with bearer token authentication and SSE streaming support.
 
 ## Overview
 
-This scaffold provides a robust infrastructure for deploying MCP servers with:
+This repository provides the infrastructure for deploying the Z.AI Vision MCP Server with:
 - **Bearer token authentication** for secure access
 - **SSE streaming** for real-time MCP protocol communication  
 - **Health monitoring** and graceful startup handling
@@ -22,67 +22,57 @@ npm install
 ### 2. Set Required Environment Variables
 
 **Required:**
-- `MCP_COMMAND` - Command to start your MCP server
+- `MCP_COMMAND` - Command to start Z.AI Vision MCP Server (default: `npx -y @z_ai/mcp-server`)
+- `Z_AI_API_KEY` - Your Z.AI API key (get from https://z.ai/manage-apikey/apikey-list)
+- `Z_AI_MODE` - AI service platform (`ZAI` or `ZHIPU`)
 
 **Optional (for production):**
 - `BEARER_TOKEN` - Authentication token for API access
 - `DEBUG_LOGGING` - Enable verbose logging (`true` or `1`)
 - `PORT` - External port (default: 8080)
 
-### 3. Configure Your MCP Server
-
-Set the `MCP_COMMAND` environment variable to the command that starts your MCP server:
+### 3. Configure Z.AI Credentials
 
 ```bash
-# GitHub MCP Server
-export MCP_COMMAND="npx -y @modelcontextprotocol/server-github"
+# Z.AI Vision MCP Server command
+export MCP_COMMAND="npx -y @z_ai/mcp-server"
 
-# Linear MCP Server  
-export MCP_COMMAND="npx -y @linear-mcp/server"
-
-# Custom MCP Server
-export MCP_COMMAND="node /path/to/your/mcp-server.js"
+# Z.AI API credentials
+export Z_AI_API_KEY="your_api_key_here"
+export Z_AI_MODE="ZAI"  # or "ZHIPU" depending on platform
 ```
 
-### 4. Add Tool-Specific Environment Variables
-
-Pass through any credentials your MCP server needs:
-
-```bash
-export GITHUB_TOKEN="ghp_..."
-export LINEAR_API_KEY="lin_api_..."
-export OPENAI_API_KEY="sk-..."
-```
-
-### 5. Start the Proxy
+### 4. Start the Proxy
 
 ```bash
 node server.js
 ```
 
-The proxy will start on port 8080 and spawn your MCP server via supergateway.
+The proxy will start on port 8080 and spawn the Z.AI Vision MCP Server via supergateway.
 
 ## Architecture
 
 ```
-Client → Generic MCP Proxy (8080) → Supergateway (8000) → MCP Server (stdio)
+Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Server (stdio) → Z.AI API
 ```
 
 ### Component Details
 
-- **Generic MCP Proxy**: HTTP server with bearer auth, request routing, and SSE streaming
+- **Z.AI Vision MCP Proxy**: HTTP server with bearer auth, request routing, and SSE streaming
 - **Supergateway**: Bridges HTTP/SSE to stdio for MCP protocol communication
-- **MCP Server**: Your specific MCP tool server (any stdio-based implementation)
+- **Z.AI Vision MCP Server**: Vision AI capabilities via the Z.AI platform
 
-## Configuration
+## Configuration Summary
 
-| Environment Variable | Required | Purpose | Example |
-|---------------------|----------|---------|---------|
-| `MCP_COMMAND` | ✅ Yes | Command to start MCP server | `npx -y @modelcontextprotocol/server-github` |
-| `BEARER_TOKEN` | ⚠️ Production | Authentication for API | `$(openssl rand -base64 32)` |
-| `DEBUG_LOGGING` | ❌ No | Enable verbose logging | `true` or `1` |
-| `PORT` | ❌ No | External port | `8080` |
-| Tool-specific vars | Varies | Credentials for MCP server | `GITHUB_TOKEN`, `OPENAI_API_KEY` |
+| Configuration | Value | Reason |
+|--------------|-------|--------|
+| **MCP_COMMAND** | `npx -y @z_ai/mcp-server` | Launches Z.AI Vision MCP Server |
+| **Z_AI_API_KEY** | Secret (required) | Authenticates with Z.AI platform |
+| **Z_AI_MODE** | `ZAI` or `ZHIPU` (required) | Selects AI service platform |
+| **BEARER_TOKEN** | Secret (required in production) | Secures your deployed endpoint |
+| **Memory** | 512MB | Adequate for MCP server workload (Z.AI handles heavy processing) |
+| **CPU** | shared | Cost-optimized (Z.AI platform handles heavy vision processing) |
+| **Concurrency** | 8 soft / 10 hard | Prevents resource exhaustion |
 
 ## API Endpoints
 
@@ -113,83 +103,98 @@ TOKEN=$(openssl rand -base64 32)
 echo $TOKEN
 ```
 
-Set the token:
+## Fly.io Deployment
+
+### Deployment Instructions
+
+1. **Copy the example configuration:**
+   ```bash
+   cp fly.example.toml fly.toml
+   ```
+
+2. **Edit fly.toml:**
+   - Set app name: `app = "your-unique-app-name"`
+   - Choose region: `primary_region = "iad"` (or nearest to you)
+
+3. **Create the Fly.io app:**
+   ```bash
+   flyctl apps create your-unique-app-name
+   ```
+
+4. **Set required secrets:**
+   ```bash
+   # Generate secure bearer token
+   flyctl secrets set BEARER_TOKEN="$(openssl rand -base64 32)"
+   
+   # Set Z.AI credentials (get from https://z.ai/manage-apikey/apikey-list)
+   flyctl secrets set Z_AI_API_KEY="your_z_ai_api_key"
+   flyctl secrets set Z_AI_MODE="ZAI"  # or "ZHIPU" depending on platform
+   ```
+
+5. **Deploy:**
+   ```bash
+   flyctl deploy --remote-only
+   ```
+
+6. **Check status:**
+   ```bash
+   flyctl status
+   ```
+
+7. **View logs:**
+   ```bash
+   flyctl logs
+   ```
+
+8. **Test the endpoint:**
+   ```bash
+   curl -H "Authorization: Bearer YOUR_BEARER_TOKEN" \
+        https://your-app.fly.dev/health
+   ```
+
+### Verification Steps
+
+After deployment:
+
+1. **Check health endpoint:** `curl https://your-app.fly.dev/health`
+2. **Verify authentication:** Request without bearer token should return 401
+3. **Test SSE endpoint:** `curl -H "Authorization: Bearer YOUR_TOKEN" https://your-app.fly.dev/sse`
+4. **Monitor logs:** `flyctl logs` to ensure Z.AI MCP server starts successfully
+5. **Check resource usage:** `flyctl status` to verify memory/CPU allocation
+
+### Architecture Diagram
+
+```
+sequenceDiagram
+    participant Client as Roo Code/Kilo Code
+    participant Proxy as Fly.io (Auth Proxy)
+    participant Gateway as Supergateway
+    participant ZAI as Z.AI Vision MCP Server
+    participant API as Z.AI API Platform
+
+    Client->>Proxy: Request with Bearer Token
+    Proxy->>Proxy: Validate Bearer Token
+    Proxy->>Gateway: Forward Request (SSE)
+    Gateway->>ZAI: stdio communication
+    ZAI->>API: Vision API Call (Z_AI_API_KEY)
+    API-->>ZAI: Vision Analysis Result
+    ZAI-->>Gateway: MCP Response
+    Gateway-->>Proxy: SSE Stream
+    Proxy-->>Client: Authenticated Response
+```
+
+## Docker Deployment
+
+1. **Build and run:**
 ```bash
-export BEARER_TOKEN="$TOKEN"
-```
-
-## Deployment Examples
-
-### Fly.io Deployment
-
-1. **Create `fly.toml`:**
-```toml
-[build]
-  dockerfile = "Dockerfile"
-
-[env]
-  PORT = "8080"
-
-[env.production]
-  BEARER_TOKEN = { required = true }
-
-[processes]
-  web = "node server.js"
-
-[[services]]
-  internal_port = 8080
-  protocol = "tcp"
-```
-
-2. **Deploy:**
-```bash
-flyctl deploy --remote-only
-```
-
-3. **Set secrets:**
-```bash
-flyctl secrets set BEARER_TOKEN="$TOKEN"
-flyctl secrets set MCP_COMMAND="npx -y @modelcontextprotocol/server-github"
-flyctl secrets set GITHUB_TOKEN="ghp_..."
-```
-
-### Docker Deployment
-
-1. **Create `Dockerfile`:**
-```dockerfile
-FROM node:18-alpine
-
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-
-COPY . .
-
-EXPOSE 8080
-CMD ["node", "server.js"]
-```
-
-2. **Build and run:**
-```bash
-docker build -t mcp-proxy .
+docker build -t z-ai-vision-mcp .
 docker run -p 8080:8080 \
-  -e MCP_COMMAND="npx -y @modelcontextprotocol/server-github" \
+  -e MCP_COMMAND="npx -y @z_ai/mcp-server" \
   -e BEARER_TOKEN="$TOKEN" \
-  -e GITHUB_TOKEN="ghp_..." \
-  mcp-proxy
+  -e Z_AI_API_KEY="your_api_key" \
+  -e Z_AI_MODE="ZAI" \
+  z-ai-vision-mcp
 ```
-
-## MCP Server Compatibility
-
-This proxy works with any MCP server that:
-- Communicates via stdio
-- Follows the MCP protocol specification
-- Can be started with a command-line interface
-
-### Tested MCP Servers
-- `@modelcontextprotocol/server-github`
-- `@linear-mcp/server`
-- Custom stdio-based MCP servers
 
 ## Monitoring and Debugging
 
@@ -237,38 +242,33 @@ Response:
 ### Common Issues
 
 **"MCP_COMMAND environment variable is required"**
-- Set the `MCP_COMMAND` environment variable to your MCP server startup command
+- Set the `MCP_COMMAND` environment variable to `npx -y @z_ai/mcp-server`
 
 **"BEARER_TOKEN is required in production"**
 - Generate and set a secure bearer token for production deployments
 
 **"Gateway startup timeout"**
-- Check that your MCP command is valid and the server can start
-- Verify all required environment variables are set for your MCP server
+- Check that Z_AI_API_KEY and Z_AI_MODE are set correctly
+- Verify your Z.AI API key is valid
 
 **"Service Unavailable: MCP gateway has exited"**
 - Check the logs for startup errors
-- Ensure your MCP server is compatible and properly configured
+- Ensure Z.AI credentials are properly configured
 
 ### Debug Steps
 
-1. **Verify MCP command manually:**
+1. **Check environment variables:**
 ```bash
-eval $MCP_COMMAND --help
+env | grep -E "(MCP_COMMAND|BEARER_TOKEN|Z_AI)"
 ```
 
-2. **Check environment variables:**
-```bash
-env | grep -E "(MCP_COMMAND|BEARER_TOKEN)"
-```
-
-3. **Enable debug logging:**
+2. **Enable debug logging:**
 ```bash
 export DEBUG_LOGGING=true
 node server.js
 ```
 
-4. **Test health endpoint:**
+3. **Test health endpoint:**
 ```bash
 curl -v http://localhost:8080/health
 ```
@@ -277,9 +277,9 @@ curl -v http://localhost:8080/health
 
 - **Always use bearer tokens in production** - the endpoint is otherwise publicly accessible
 - **Rotate tokens regularly** - implement token rotation in your deployment pipeline
-- **Limit token scope** - use tokens with minimal required permissions
+- **Never commit secrets** - use Fly.io secrets or environment variables
 - **Monitor access logs** - watch for unauthorized access attempts
-- **Use HTTPS in production** - terminate TLS at your load balancer or reverse proxy
+- **Use HTTPS in production** - Fly.io provides automatic TLS
 
 ## Performance
 
@@ -290,4 +290,4 @@ curl -v http://localhost:8080/health
 
 ## License
 
-MIT License - feel free to use this scaffold for your MCP server deployments.
+MIT License - feel free to use this scaffold for your Z.AI Vision MCP Server deployments.

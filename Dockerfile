@@ -1,5 +1,5 @@
-# Generic MCP Proxy Dockerfile
-# This Dockerfile creates a minimal, production-ready container for the generic MCP proxy
+# Z.AI Vision MCP Server Proxy Dockerfile
+# This Dockerfile creates a minimal, production-ready container for the Z.AI Vision MCP proxy
 
 FROM node:18-alpine
 
@@ -10,7 +10,10 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies (production only)
-RUN npm ci --only=production && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
+
+# Add node_modules/.bin to PATH so supergateway is available
+ENV PATH="/app/node_modules/.bin:$PATH"
 
 # Copy application code
 COPY . .
