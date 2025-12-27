@@ -1,0 +1,90 @@
+# Fly.io Deployment Configuration Example
+# Copy this to fly.toml and configure for your deployment
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Server port (Fly.io sets this automatically)
+  PORT = "8080"
+  
+  # Enable debug logging in development
+  DEBUG_LOGGING = "false"
+
+[env.production]
+  # Security: Bearer token required in production
+  BEARER_TOKEN = { required = true }
+  
+  # Debug logging off in production for performance
+  DEBUG_LOGGING = "false"
+
+[env.staging]
+  # Staging environment configuration
+  DEBUG_LOGGING = "true"
+
+# HTTP service configuration
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+    type = "connections"
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.tcp_checks]]
+    grace_period = "1s"
+    interval = "15s"
+    restart_limit = 0
+    timeout = "2s"
+
+  [[services.http_checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    restart_limit = 0
+    timeout = "5s"
+    tls_skip_verify = false
+
+# Process configuration
+[processes]
+  web = "node server.js"
+
+# Resource configuration
+[resources]
+  cpu = "shared"
+  memory = "512mb"
+
+# Deploy configuration
+[deploy]
+  strategy = "rolling"
+
+# Auto-scaling (optional)
+[autoscaling]
+  enabled = false
+  min_visible_instances = 1
+  max_visible_instances = 2
+
+# =============================================================================
+# DEPLOYMENT INSTRUCTIONS:
+# =============================================================================
+# 1. Copy this file: cp fly.example.toml fly.toml
+# 2. Edit fly.toml with your specific configuration
+# 3. Set required secrets:
+#    flyctl secrets set MCP_COMMAND="npx -y @modelcontextprotocol/server-github"
+#    flyctl secrets set BEARER_TOKEN="$(openssl rand -base64 32)"
+#    flyctl secrets set GITHUB_TOKEN="ghp_your_token"
+# 4. Deploy: flyctl deploy --remote-only
+# 5. Check status: flyctl status
+# 6. View logs: flyctl logs
+# =============================================================================
