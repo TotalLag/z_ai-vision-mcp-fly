@@ -1,3 +1,4 @@
 {"name": "z-ai-vision-mcp-fly", "version": "1.0.0", "description": "Z.AI Vision MCP Server hosted on Fly.io with bearer token authentication and SSE streaming support", "main": "server.js", "scripts": {"start": "node server.js", "dev": "DEBUG_LOGGING=true node server.js", "test": "echo \"No tests specified\" && exit 0"}, "keywords": ["mcp", "model-context-protocol", "proxy", "server", "sse", "authentication", "z-ai", "vision", "image-analysis", "ocr", "ui-to-code"], "author": "", "license": "MIT", "engines": {"node": ">=18.0.0"}, "dependencies": {
-    "supergateway": "^3.0.0"
+    "supergateway": "^3.0.0",
+    "busboy": "^1.6.0"
   }, "peerDependencies": {}, "repository": {"type": "git", "url": "https://github.com/oraios/z-ai-vision-mcp-fly.git"}, "bugs": {"url": "https://github.com/oraios/z-ai-vision-mcp-fly/issues"}, "homepage": "https://github.com/oraios/z-ai-vision-mcp-fly#readme"}

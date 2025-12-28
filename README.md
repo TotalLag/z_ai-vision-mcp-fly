@@ -61,6 +61,8 @@ Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Ser
 - **Z.AI Vision MCP Proxy**: HTTP server with bearer auth, request routing, and SSE streaming
 - **Supergateway**: Bridges HTTP/SSE to stdio for MCP protocol communication
 - **Z.AI Vision MCP Server**: Vision AI capabilities via the Z.AI platform
+- **Automatic File Transformation**: Converts local file paths to base64 for Z.ai Vision tools
+- **MCP Resource Discovery**: Provides capability discovery for AI agents
 
 ## Configuration Summary
 
@@ -75,6 +77,83 @@ Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Ser
 | **Concurrency** | 8 soft / 10 hard | Prevents resource exhaustion |
 
 ## API Endpoints
+
+### Agent Integration & Resource Discovery
+
+This server implements MCP (Model Context Protocol) resource discovery to help AI agents understand available capabilities and automatically handle local file paths for Z.ai Vision tools.
+
+#### Automatic File Handling
+
+Local file paths in Z.ai Vision tool calls are automatically converted to base64 format before being sent to the MCP gateway. This allows agents to use local file paths seamlessly without manual conversion.
+
+#### Resource Discovery Protocol
+
+The server supports standard MCP resource discovery methods:
+
+- **`resources/list`**: Returns metadata about available resources, including the upload endpoint
+- **`resources/read`**: Provides detailed instructions for using the upload endpoint
+- **`tools/list`**: Enhanced responses include upload capability hints for Z.ai Vision tools
+
+#### Agent Workflow
+
+```mermaid
+sequenceDiagram
+    participant Agent as AI Agent (Traycer)
+    participant Proxy as MCP Proxy Server
+    participant Gateway as Supergateway
+    participant Vision as Z.AI Vision MCP
+    
+    Note over Agent,Vision: Resource Discovery Phase
+    Agent->>Proxy: resources/list
+    Proxy-->>Agent: upload://images resource
+    Agent->>Proxy: resources/read(upload://images)
+    Proxy-->>Agent: Upload endpoint details
+    
+    Note over Agent,Vision: Tool Discovery Phase
+    Agent->>Proxy: tools/list
+    Proxy->>Gateway: tools/list
+    Gateway->>Vision: tools/list
+    Vision-->>Gateway: Tool definitions
+    Gateway-->>Proxy: Tool definitions
+    Proxy->>Proxy: Enhance descriptions
+    Proxy-->>Agent: Enhanced tool definitions
+    
+    Note over Agent,Vision: Tool Execution Phase
+    Agent->>Proxy: tools/call(local_path)
+    Proxy->>Proxy: Transform to base64
+    Proxy->>Gateway: tools/call(base64)
+    Gateway->>Vision: Execute tool
+    Vision-->>Gateway: Result
+    Gateway-->>Proxy: Result
+    Proxy-->>Agent: Result
+```
+
+#### For Agent Developers
+
+AI agents should implement this workflow:
+
+1. **On Connection**: Query `resources/list` to discover available capabilities
+2. **Read Upload Details**: Use `resources/read` with `uri: "upload://images"` to get upload instructions
+3. **Trust Automatic Transformation**: Use local file paths in Z.ai Vision tool calls - they will be automatically converted
+4. **Optional Explicit Upload**: Use POST `/upload` for explicit file uploads if needed
+
+#### Testing Resource Discovery
+
+Test the resource discovery endpoints:
+
+```bash
+# Test resources/list
+curl -X POST http://localhost:8080/sse \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"resources/list","id":1}'
+
+# Test resources/read
+curl -X POST http://localhost:8080/sse \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"upload://images"},"id":2}'
+```
 
 ### `GET /sse`
 SSE endpoint for MCP protocol communication (requires bearer token in production)
@@ -287,6 +366,24 @@ curl -v http://localhost:8080/health
 - **SSE streaming** - long-lived connections are properly managed with no timeout
 - **Request buffering** - HTTP requests are buffered; SSE responses are streamed
 - **Resource limits** - gateway process has 50MB buffer limit to prevent memory issues
+
+### Agent Integration Issues
+
+**Agent not detecting upload capability**
+- Verify `resources/list` returns the expected upload://images resource
+- Check server logs for 'resource-list' entries
+- Ensure the agent is using the correct MCP discovery protocol
+
+**File transformation not working**
+- Check that file paths are in the correct format (absolute or relative paths)
+- Verify file permissions and accessibility
+- Look for 'file-transform' entries in server logs
+- Ensure the tool name matches Z.ai Vision tools (ui_to_artifact, analyze_image, etc.)
+
+**Enhanced tool descriptions missing**
+- Confirm the original request was for 'tools/list'
+- Check for 'tools-enhance' log entries
+- Verify the response contains Z.ai Vision tools
 
 ## License
 
