@@ -13,7 +13,7 @@ primary_region = 'iad'
   strategy = 'rolling'
 
 [env]
-  DEBUG_LOGGING = 'false'
+  DEBUG_LOGGING = 'true'
   MCP_COMMAND = 'npx -y @z_ai/mcp-server'
   PORT = '8080'
 

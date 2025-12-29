@@ -36,7 +36,8 @@ const Busboy = require('busboy');
 // Gateway lifecycle state
 const gatewayState = {
   // Track active SSE sessions for sending responses
-  // Each entry: { res: response object, alive: boolean, keepaliveInterval: interval ID }
+  // Each entry: { res: response object, alive: boolean }
+  // Note: keepaliveInterval removed to allow Fly.io to sleep when idle
   sseSessions: new Map(),
   isReady: false,
   hasExited: false,
@@ -55,7 +56,7 @@ const PORT = process.env.PORT || 8080;
 const INTERNAL_PORT = 8000;
 const BEARER_TOKEN = process.env.BEARER_TOKEN;
 const MCP_COMMAND = process.env.MCP_COMMAND;
-const DEBUG_LOGGING = process.env.DEBUG_LOGGING === 'true' || process.env.DEBUG_LOGGING === '1';
+const DEBUG_LOGGING = false; // Disabled for production - set to true only for debugging
 
 // Environment detection for security enforcement
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -106,7 +107,7 @@ function logMCP(level, category, message, data = null) {
   
   if (level === 'error') {
     console.error(JSON.stringify(logEntry));
-  } else if (DEBUG_LOGGING || level === 'warn') {
+  } else if (level === 'warn') {
     console.log(JSON.stringify(logEntry));
   }
 }
@@ -121,8 +122,8 @@ function logRuntime(level, category, message, data = null) {
   logMCP(level, category, message, { ...data, phase: 'runtime' });
 }
 
-// SSE Keepalive interval (30 seconds)
-const SSE_KEEPALIVE_INTERVAL_MS = 30000;
+// SSE Keepalive interval (disabled for Fly.io sleep optimization)
+// const SSE_KEEPALIVE_INTERVAL_MS = 30000;
 
 /**
  * Safely write to an SSE connection with error handling
@@ -156,43 +157,22 @@ function safeSSEWrite(sessionId, data) {
 }
 
 /**
- * Start keepalive for an SSE session
+ * Start keepalive for an SSE session (DISABLED for Fly.io sleep optimization)
  * @param {string} sessionId - The session ID
  */
 function startSSEKeepalive(sessionId) {
-  const session = gatewayState.sseSessions.get(sessionId);
-  if (!session) return;
+  // Keepalive functionality disabled to allow Fly.io to sleep when idle
+  // const session = gatewayState.sseSessions.get(sessionId);
+  // if (!session) return;
   
-  // Clear any existing keepalive
-  if (session.keepaliveInterval) {
-    clearInterval(session.keepaliveInterval);
-  }
+  // Previously this function would:
+  // 1. Clear any existing keepalive intervals
+  // 2. Start new setInterval to send keepalive comments every 30 seconds
+  // 3. Mark sessions as dead if keepalive fails
   
-  // Start new keepalive interval
-  session.keepaliveInterval = setInterval(() => {
-    if (!session.alive) {
-      clearInterval(session.keepaliveInterval);
-      return;
-    }
-    
-    try {
-      // SSE comment for keepalive (starts with colon)
-      session.res.write(': keepalive\n\n');
-      logMCP('debug', 'sse-keepalive', 'Sent keepalive', { sessionId });
-    } catch (error) {
-      logMCP('warn', 'sse-keepalive', 'Keepalive failed, marking session dead', {
-        sessionId,
-        error: error.message
-      });
-      session.alive = false;
-      clearInterval(session.keepaliveInterval);
-    }
-  }, SSE_KEEPALIVE_INTERVAL_MS);
-  
-  logMCP('info', 'sse-keepalive', 'Started keepalive for session', {
-    sessionId,
-    intervalMs: SSE_KEEPALIVE_INTERVAL_MS
-  });
+  // logMCP('info', 'sse-keepalive', 'Keepalive disabled for Fly.io sleep optimization', {
+  //   sessionId
+  // });
 }
 
 /**
@@ -202,9 +182,10 @@ function startSSEKeepalive(sessionId) {
 function cleanupSSESession(sessionId) {
   const session = gatewayState.sseSessions.get(sessionId);
   if (session) {
-    if (session.keepaliveInterval) {
-      clearInterval(session.keepaliveInterval);
-    }
+    // Keepalive interval cleanup disabled (no keepalive intervals to clear)
+    // if (session.keepaliveInterval) {
+    //   clearInterval(session.keepaliveInterval);
+    // }
     session.alive = false;
     gatewayState.sseSessions.delete(sessionId);
     logMCP('info', 'sse-cleanup', 'Cleaned up SSE session', { sessionId });
@@ -383,12 +364,12 @@ async function transformToolArguments(args, toolName) {
             } else {
               // Log successful validation
               const pathType = isServerUploadPath ? 'server-upload' : (isURL(value) ? 'url' : 'base64');
-              logMCP('debug', 'file-validation', 'File path validated', {
-                toolName,
-                parameterName: key,
-                pathType,
-                originalPath: value
-              });
+              // logMCP('debug', 'file-validation', 'File path validated', {
+              //   toolName,
+              //   parameterName: key,
+              //   pathType,
+              //   originalPath: value
+              // }); // Disabled debug logging
             }
           }
         } else if (Array.isArray(value)) {
@@ -408,13 +389,13 @@ async function transformToolArguments(args, toolName) {
             } else {
               // Log successful validation for array items
               const pathType = isItemServerUploadPath ? 'server-upload' : (isURL(item) ? 'url' : 'base64');
-              logMCP('debug', 'file-validation', 'File path in array validated', {
-                toolName,
-                parameterName: key,
-                arrayIndex: i,
-                pathType,
-                originalPath: item
-              });
+              // logMCP('debug', 'file-validation', 'File path in array validated', {
+              //   toolName,
+              //   parameterName: key,
+              //   arrayIndex: i,
+              //   pathType,
+              //   originalPath: item
+              // }); // Disabled debug logging
             }
             
             if (typeof item === 'object' && item !== null) {
@@ -1098,11 +1079,11 @@ function processRequest(req, res) {
               transformed: true
             });
           } else {
-            logMCP('debug', 'file-transform', 'No file transformations needed', {
-              requestId,
-              toolName,
-              transformed: false
-            });
+            // logMCP('debug', 'file-transform', 'No file transformations needed', {
+            //   requestId,
+            //   toolName,
+            //   transformed: false
+            // }); // Disabled debug logging
           }
         } catch (error) {
           logMCP('error', 'file-validation', 'Invalid file path in tool arguments', {
@@ -1258,14 +1239,14 @@ function processRequest(req, res) {
             ) : {}
           });
           
-          // Log full arguments in debug mode
-          if (DEBUG_LOGGING) {
-            logMCP('debug', 'tool-args', 'Full tool arguments', {
-              requestId,
-              toolName,
-              arguments: toolArgs
-            });
-          }
+          // Log full arguments in debug mode (disabled)
+          // if (DEBUG_LOGGING) {
+          //   logMCP('debug', 'tool-args', 'Full tool arguments', {
+          //     requestId,
+          //     toolName,
+          //     arguments: toolArgs
+          //   });
+          // }
           
           // Handle upload_file tool - returns instructions for using the public /upload endpoint
           // This avoids passing large base64 strings through the MCP protocol
@@ -1435,14 +1416,13 @@ function processRequest(req, res) {
               const sessionMatch = eventData.match(/sessionId=([^&\s]+)/);
               if (sessionMatch) {
                 currentSessionId = sessionMatch[1];
-                // Store this SSE connection for the session with keepalive support
+                // Store this SSE connection for the session (keepalive disabled for Fly.io)
                 gatewayState.sseSessions.set(currentSessionId, {
                   res: res,
-                  alive: true,
-                  keepaliveInterval: null
+                  alive: true
+                  // keepaliveInterval: null // Removed - no keepalive intervals
                 });
-                // Start keepalive for this session
-                startSSEKeepalive(currentSessionId);
+                // startSSEKeepalive(currentSessionId); // Disabled to allow Fly.io to sleep
                 logMCP('info', 'sse-session-track', 'Tracking SSE session', {
                   requestId,
                   sessionId: currentSessionId
@@ -1635,10 +1615,10 @@ function processRequest(req, res) {
                   ).length
                 });
               } else {
-                logMCP('debug', 'tools-enhance', 'No Z.ai Vision tools found in tools/list response', {
-                  requestId,
-                  toolNames: responseJson.result.tools.map(tool => tool.name)
-                });
+                // logMCP('debug', 'tools-enhance', 'No Z.ai Vision tools found in tools/list response', {
+                //   requestId,
+                //   toolNames: responseJson.result.tools.map(tool => tool.name)
+                // }); // Disabled debug logging
               }
             }
             
@@ -1747,7 +1727,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Generic MCP proxy ready at http://0.0.0.0:${PORT}`);
   console.log(`SSE endpoint: http://0.0.0.0:${PORT}/sse`);
   console.log(`Upload endpoint: http://0.0.0.0:${PORT}/upload`);
-  console.log(`Debug logging: ${DEBUG_LOGGING ? 'ENABLED' : 'DISABLED (set DEBUG_LOGGING=true to enable)'}`);
+  console.log('Debug logging: DISABLED');
 });
 
 // Graceful shutdown handler
