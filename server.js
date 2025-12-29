@@ -10,7 +10,7 @@
  * 6. Accepts image file uploads via POST /upload endpoint
  *
  * Architecture:
- *   Client → Auth Proxy (8080) → [/upload → Base64 Conversion]
+ *   Client → Auth Proxy (8080) → [/upload → File Storage (serverPath)]
  *                               → [other paths → Supergateway (8000) → MCP Server (stdio)]
  *
  * SSE Streaming:
@@ -35,6 +35,9 @@ const Busboy = require('busboy');
 
 // Gateway lifecycle state
 const gatewayState = {
+  // Track active SSE sessions for sending responses
+  // Each entry: { res: response object, alive: boolean, keepaliveInterval: interval ID }
+  sseSessions: new Map(),
   isReady: false,
   hasExited: false,
   exitCode: null,
@@ -116,6 +119,96 @@ function logStartup(level, message, data = null) {
 // Log runtime-specific events
 function logRuntime(level, category, message, data = null) {
   logMCP(level, category, message, { ...data, phase: 'runtime' });
+}
+
+// SSE Keepalive interval (30 seconds)
+const SSE_KEEPALIVE_INTERVAL_MS = 30000;
+
+/**
+ * Safely write to an SSE connection with error handling
+ * @param {string} sessionId - The session ID
+ * @param {string} data - The data to write (should be formatted as SSE event)
+ * @returns {boolean} True if write succeeded, false if connection is dead
+ */
+function safeSSEWrite(sessionId, data) {
+  const session = gatewayState.sseSessions.get(sessionId);
+  if (!session || !session.alive) {
+    logMCP('warn', 'sse-write', 'Attempted to write to dead/missing SSE session', {
+      sessionId,
+      hasSession: !!session,
+      alive: session?.alive
+    });
+    return false;
+  }
+  
+  try {
+    session.res.write(data);
+    return true;
+  } catch (error) {
+    logMCP('error', 'sse-write', 'Failed to write to SSE stream', {
+      sessionId,
+      error: error.message
+    });
+    // Mark session as dead
+    session.alive = false;
+    return false;
+  }
+}
+
+/**
+ * Start keepalive for an SSE session
+ * @param {string} sessionId - The session ID
+ */
+function startSSEKeepalive(sessionId) {
+  const session = gatewayState.sseSessions.get(sessionId);
+  if (!session) return;
+  
+  // Clear any existing keepalive
+  if (session.keepaliveInterval) {
+    clearInterval(session.keepaliveInterval);
+  }
+  
+  // Start new keepalive interval
+  session.keepaliveInterval = setInterval(() => {
+    if (!session.alive) {
+      clearInterval(session.keepaliveInterval);
+      return;
+    }
+    
+    try {
+      // SSE comment for keepalive (starts with colon)
+      session.res.write(': keepalive\n\n');
+      logMCP('debug', 'sse-keepalive', 'Sent keepalive', { sessionId });
+    } catch (error) {
+      logMCP('warn', 'sse-keepalive', 'Keepalive failed, marking session dead', {
+        sessionId,
+        error: error.message
+      });
+      session.alive = false;
+      clearInterval(session.keepaliveInterval);
+    }
+  }, SSE_KEEPALIVE_INTERVAL_MS);
+  
+  logMCP('info', 'sse-keepalive', 'Started keepalive for session', {
+    sessionId,
+    intervalMs: SSE_KEEPALIVE_INTERVAL_MS
+  });
+}
+
+/**
+ * Clean up an SSE session
+ * @param {string} sessionId - The session ID
+ */
+function cleanupSSESession(sessionId) {
+  const session = gatewayState.sseSessions.get(sessionId);
+  if (session) {
+    if (session.keepaliveInterval) {
+      clearInterval(session.keepaliveInterval);
+    }
+    session.alive = false;
+    gatewayState.sseSessions.delete(sessionId);
+    logMCP('info', 'sse-cleanup', 'Cleaned up SSE session', { sessionId });
+  }
 }
 
 // Parse and validate JSON safely, returning detailed error info
@@ -216,55 +309,6 @@ function isImageFile(filePath) {
   return imageExtensions.some(ext => lowerPath.endsWith(ext));
 }
 
-/**
- * Convert a local file to base64 data URI
- * @param {string} filePath - Path to the local file
- * @returns {Promise<string>} Data URI with base64 content
- */
-async function convertFileToBase64(filePath) {
-  try {
-    // Check if file exists and get stats
-    const stats = await fs.promises.stat(filePath);
-    
-    if (!stats.isFile()) {
-      throw new Error(`Path is not a file: ${filePath}`);
-    }
-    
-    // Check file size (max 10MB)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (stats.size > maxSize) {
-      throw new Error(`File too large: ${stats.size} bytes (max ${maxSize} bytes)`);
-    }
-    
-    // Read file content
-    const fileBuffer = await fs.promises.readFile(filePath);
-    
-    // Detect MIME type based on file extension
-    const lowerPath = filePath.toLowerCase();
-    let mimeType = 'application/octet-stream'; // default
-    
-    if (lowerPath.endsWith('.png')) mimeType = 'image/png';
-    else if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) mimeType = 'image/jpeg';
-    else if (lowerPath.endsWith('.gif')) mimeType = 'image/gif';
-    else if (lowerPath.endsWith('.webp')) mimeType = 'image/webp';
-    else if (lowerPath.endsWith('.bmp')) mimeType = 'image/bmp';
-    
-    // Convert to base64
-    const base64Data = fileBuffer.toString('base64');
-    
-    // Return data URI
-    return `data:${mimeType};base64,${base64Data}`;
-    
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      throw new Error(`File not found: ${filePath}`);
-    } else if (error.code === 'EACCES') {
-      throw new Error(`Permission denied: ${filePath}`);
-    } else {
-      throw new Error(`Failed to read file ${filePath}: ${error.message}`);
-    }
-  }
-}
 
 /**
  * Recursively transform tool arguments, converting local file paths to base64 data URIs
@@ -278,6 +322,7 @@ async function transformToolArguments(args, toolName) {
   }
   
   // Known image parameter names for Z.ai Vision tools
+  // These parameters will have their local file paths converted to base64 data URIs
   const imageParamNames = [
     'image_path', 'image', 'images', 'screenshot_path', 'file_path', 'path',
     'image_source', 'image_files', 'input_image', 'input_images'
@@ -293,7 +338,8 @@ async function transformToolArguments(args, toolName) {
     'analyze_data_visualization',
     'ui_diff_check',
     'analyze_image',
-    'analyze_video'
+    'analyze_video',
+    'upload_file'  // Also transform file paths for upload_file tool
   ];
   
   // Check if tool name is in the explicit allowlist
@@ -325,32 +371,24 @@ async function transformToolArguments(args, toolName) {
           // Skip if already URL, base64, or data URI
           if (!isURL(value) && !isBase64OrDataURI(value)) {
             // Check if it looks like a local file path
-            if (isLocalFilePath(value) && isImageFile(value)) {
-              try {
-                const startTime = Date.now();
-                const dataUri = await convertFileToBase64(value);
-                const endTime = Date.now();
-                
-                logMCP('info', 'file-transform', 'File converted to data URI', {
-                  originalPath: value,
-                  dataUriLength: dataUri.length,
-                  conversionTimeMs: endTime - startTime,
-                  toolName,
-                  parameterName: key
-                });
-                
-                transformedValue = dataUri;
-              } catch (error) {
-                logMCP('warn', 'file-transform', 'Failed to convert file to base64', {
-                  originalPath: value,
-                  error: error.message,
-                  toolName,
-                  parameterName: key
-                });
-                
-                // Keep original value if conversion fails
-                transformedValue = value;
-              }
+            // BUT skip paths in /tmp/mcp-uploads/ - these are already on the server
+            const isServerUploadPath = value.startsWith('/tmp/mcp-uploads/');
+            if (isLocalFilePath(value) && isImageFile(value) && !isServerUploadPath) {
+              // Throw error for local file paths - require explicit upload workflow
+              const error = new Error(`Local file path detected: '${value}'. Please upload the file via POST /upload endpoint first to get a serverPath, then use that serverPath in your tool call.`);
+              error.originalPath = value;
+              error.toolName = toolName;
+              error.parameterName = key;
+              throw error;
+            } else {
+              // Log successful validation
+              const pathType = isServerUploadPath ? 'server-upload' : (isURL(value) ? 'url' : 'base64');
+              logMCP('debug', 'file-validation', 'File path validated', {
+                toolName,
+                parameterName: key,
+                pathType,
+                originalPath: value
+              });
             }
           }
         } else if (Array.isArray(value)) {
@@ -358,35 +396,28 @@ async function transformToolArguments(args, toolName) {
           const transformedArray = [];
           for (let i = 0; i < value.length; i++) {
             const item = value[i];
-            if (typeof item === 'string' && isLocalFilePath(item) && isImageFile(item)) {
-              try {
-                const startTime = Date.now();
-                const dataUri = await convertFileToBase64(item);
-                const endTime = Date.now();
-                
-                logMCP('info', 'file-transform', 'File in array converted to data URI', {
-                  originalPath: item,
-                  arrayIndex: i,
-                  dataUriLength: dataUri.length,
-                  conversionTimeMs: endTime - startTime,
-                  toolName,
-                  parameterName: key
-                });
-                
-                transformedArray.push(dataUri);
-              } catch (error) {
-                logMCP('warn', 'file-transform', 'Failed to convert file in array', {
-                  originalPath: item,
-                  arrayIndex: i,
-                  error: error.message,
-                  toolName,
-                  parameterName: key
-                });
-                
-                // Keep original value if conversion fails
-                transformedArray.push(item);
-              }
-            } else if (typeof item === 'object' && item !== null) {
+            const isItemServerUploadPath = typeof item === 'string' && item.startsWith('/tmp/mcp-uploads/');
+            if (typeof item === 'string' && isLocalFilePath(item) && isImageFile(item) && !isItemServerUploadPath) {
+              // Throw error for local file paths - require explicit upload workflow
+              const error = new Error(`Local file path detected: '${item}'. Please upload the file via POST /upload endpoint first to get a serverPath, then use that serverPath in your tool call.`);
+              error.originalPath = item;
+              error.toolName = toolName;
+              error.parameterName = key;
+              error.arrayIndex = i;
+              throw error;
+            } else {
+              // Log successful validation for array items
+              const pathType = isItemServerUploadPath ? 'server-upload' : (isURL(item) ? 'url' : 'base64');
+              logMCP('debug', 'file-validation', 'File path in array validated', {
+                toolName,
+                parameterName: key,
+                arrayIndex: i,
+                pathType,
+                originalPath: item
+              });
+            }
+            
+            if (typeof item === 'object' && item !== null) {
               // Recursively transform nested objects/arrays in array items
               transformedArray.push(await transformToolArguments(item, toolName));
             } else {
@@ -408,6 +439,253 @@ async function transformToolArguments(args, toolName) {
   
   // Return primitive values unchanged
   return args;
+}
+
+/**
+ * Handle file upload endpoint (PUBLIC - no auth required)
+ * This function is called before gateway checks so uploads work even if gateway is down
+ */
+function handleFileUpload(req, res) {
+  /**
+   * File Upload Endpoint (PUBLIC - No Authentication Required)
+   *
+   * This endpoint is intentionally public to allow AI agents to upload files
+   * directly using curl or execute_command.
+   *
+   * Accepts multipart/form-data image uploads, validates them,
+   * saves to server, and returns JSON with serverPath for use with vision tools.
+   *
+   * This endpoint does NOT proxy to supergateway - it handles
+   * uploads directly to support remote MCP server scenarios
+   * where local file paths are not accessible.
+   *
+   * @route POST /upload (PUBLIC - No bearer token required)
+   * @param {File} file - Image file (png, jpeg, gif, webp, bmp)
+   * @returns {Object} JSON with serverPath, filename, mimeType, and size
+   */
+  
+  // Check for multipart content type
+  const contentType = req.headers['content-type'];
+  if (!contentType || !contentType.startsWith('multipart/form-data')) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: false,
+      error: 'Content-Type must be multipart/form-data'
+    }));
+    return;
+  }
+
+  // Upload validation constants
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+  const ALLOWED_MIME_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/bmp'];
+
+  // Set request timeout
+  req.setTimeout(30000); // 30 seconds
+
+  // Track upload state
+  let fileReceived = false;
+  let fileBuffer = [];
+  let fileSize = 0;
+  let mimeType = null;
+  let filename = null;
+  let fileCount = 0;
+  let responded = false;
+
+  // Helper function to send response safely with double-response guard
+  const sendResponse = (statusCode, body) => {
+    if (responded) return;
+    responded = true;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  // Helper function to halt processing after early errors
+  const haltProcessing = (busboy, errorMessage = 'Early validation failed') => {
+    try {
+      busboy.destroy(new Error(errorMessage));
+      req.unpipe(busboy);
+    } catch (e) {
+      // Ignore errors from cleanup
+    }
+  };
+
+  // Log upload start
+  logMCP('info', 'upload-start', 'File upload started', {
+    contentType: contentType,
+    contentLength: req.headers['content-length']
+  });
+
+  // Initialize busboy
+  const busboy = Busboy({ headers: req.headers });
+
+  // Handle file upload
+  busboy.on('file', (fieldname, file, info) => {
+    fileCount++;
+    
+    // Check if multiple files uploaded
+    if (fileCount > 1) {
+      logMCP('error', 'upload-validation', 'Multiple files uploaded - only one allowed', {
+        fileCount
+      });
+      file.destroy();
+      sendResponse(400, {
+        success: false,
+        error: 'Only one file allowed per upload'
+      });
+      haltProcessing(busboy, 'Multiple files uploaded');
+      return;
+    }
+
+    filename = info.filename;
+    mimeType = info.mimeType;
+
+    // Validate MIME type
+    if (!ALLOWED_MIME_TYPES.includes(mimeType)) {
+      logMCP('error', 'upload-validation', 'Invalid MIME type uploaded', {
+        filename,
+        mimeType,
+        allowedTypes: ALLOWED_MIME_TYPES
+      });
+      file.destroy();
+      sendResponse(400, {
+        success: false,
+        error: `Invalid file type. Allowed types: ${ALLOWED_MIME_TYPES.join(', ')}`
+      });
+      haltProcessing(busboy, 'Invalid MIME type');
+      return;
+    }
+
+    fileReceived = true;
+
+    // Log file start
+    logMCP('info', 'upload-file', 'File upload in progress', {
+      filename,
+      mimeType
+    });
+
+    // Stream file chunks
+    file.on('data', (data) => {
+      fileSize += data.length;
+      
+      // Check file size limit
+      if (fileSize > MAX_FILE_SIZE) {
+        logMCP('error', 'upload-validation', 'File size exceeded limit', {
+          filename,
+          fileSize,
+          maxSize: MAX_FILE_SIZE
+        });
+        file.destroy();
+        sendResponse(413, {
+          success: false,
+          error: `File too large. Maximum size: ${MAX_FILE_SIZE / (1024 * 1024)}MB`
+        });
+        haltProcessing(busboy, 'File size exceeded');
+        return;
+      }
+
+      fileBuffer.push(data);
+    });
+
+    file.on('end', () => {
+      logMCP('info', 'upload-chunk', 'File chunk received', {
+        filename,
+        chunkSize: fileBuffer[fileBuffer.length - 1]?.length || 0
+      });
+    });
+  });
+
+  // Handle busboy errors
+  busboy.on('error', (err) => {
+    if (responded) return; // Guard against double response
+    logMCP('error', 'upload-parse', 'Busboy parsing error', {
+      error: err.message
+    });
+    sendResponse(400, {
+      success: false,
+      error: 'Failed to parse multipart data'
+    });
+  });
+
+  // Handle upload completion
+  busboy.on('finish', () => {
+    // Guard against double response (e.g., if early error already sent response)
+    if (responded) return;
+
+    // Check if file was uploaded
+    if (!fileReceived) {
+      logMCP('error', 'upload-validation', 'No file uploaded', {});
+      sendResponse(400, {
+        success: false,
+        error: 'No file uploaded'
+      });
+      return;
+    }
+
+    try {
+      // Concatenate file buffer
+      const completeBuffer = Buffer.concat(fileBuffer);
+      
+      // Save file to server for use with vision tools
+      const uploadsDir = path.join(os.tmpdir(), 'mcp-uploads');
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      
+      // Generate unique filename with timestamp
+      const timestamp = Date.now();
+      const randomSuffix = Math.random().toString(36).substring(2, 8);
+      const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const uniqueFilename = `${timestamp}_${randomSuffix}_${safeFilename}`;
+      const savedFilePath = path.join(uploadsDir, uniqueFilename);
+      
+      // Write file to uploads directory
+      fs.writeFileSync(savedFilePath, completeBuffer);
+
+      // Log successful upload
+      logMCP('info', 'upload-success', 'File upload completed successfully', {
+        filename,
+        mimeType,
+        fileSize,
+        savedPath: savedFilePath
+      });
+
+      // Return success response with server path for vision tools (serverPath-only workflow)
+      sendResponse(200, {
+        success: true,
+        filename,
+        mimeType,
+        size: fileSize,
+        serverPath: savedFilePath
+      });
+
+    } catch (error) {
+      logMCP('error', 'upload-process', 'Error processing uploaded file', {
+        filename,
+        error: error.message
+      });
+      sendResponse(500, {
+        success: false,
+        error: 'Failed to process uploaded file'
+      });
+    }
+  });
+
+  // Handle request timeout
+  req.on('timeout', () => {
+    if (responded) return; // Guard against double response
+    logMCP('error', 'upload-timeout', 'Upload request timed out', {
+      filename,
+      fileSize
+    });
+    haltProcessing(busboy, 'Request timeout');
+    sendResponse(408, {
+      success: false,
+      error: 'Request timeout'
+    });
+  });
+
+  // Pipe request to busboy
+  req.pipe(busboy);
 }
 
 // Start supergateway in background using shell command
@@ -591,7 +869,7 @@ const server = http.createServer((req, res) => {
       gatewayReady: gatewayState.isReady,
       gatewayExited: gatewayState.hasExited,
       uptimeMs: Date.now() - gatewayState.startTime,
-      uploadEndpoint: '/upload',
+      uploadEndpoint: '/upload (PUBLIC - no auth required)',
       supportedImageTypes: ['png', 'jpeg', 'jpg', 'gif', 'webp', 'bmp'],
       maxUploadSize: '10MB',
       fileTransformation: {
@@ -610,6 +888,13 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(status));
     }
+    return;
+  }
+
+  // Handle file upload endpoint BEFORE gateway checks (PUBLIC - no auth required)
+  // This endpoint works independently of the MCP gateway
+  if (req.url === '/upload' && req.method === 'POST') {
+    handleFileUpload(req, res);
     return;
   }
 
@@ -722,8 +1007,7 @@ const server = http.createServer((req, res) => {
 
 // Extracted request processing logic
 function processRequest(req, res) {
-
-  // Check bearer token if configured
+  // Check bearer token for all endpoints that reach here (upload is handled before gateway checks)
   if (BEARER_TOKEN) {
     const auth = req.headers.authorization;
     if (!auth || auth !== `Bearer ${BEARER_TOKEN}`) {
@@ -731,237 +1015,6 @@ function processRequest(req, res) {
       res.end('Unauthorized: Invalid or missing bearer token');
       return;
     }
-  }
-
-  // Handle file upload endpoint
-  if (req.url === '/upload' && req.method === 'POST') {
-    /**
-     * File Upload Endpoint
-     * 
-     * Accepts multipart/form-data image uploads, validates them,
-     * converts to base64, and returns JSON with encoded data.
-     * 
-     * This endpoint does NOT proxy to supergateway - it handles
-     * uploads directly to support remote MCP server scenarios
-     * where local file paths are not accessible.
-     * 
-     * @route POST /upload
-     * @param {File} file - Image file (png, jpeg, gif, webp, bmp)
-     * @returns {Object} JSON with base64 encoded image data
-     */
-    
-    // Check for multipart content type
-    const contentType = req.headers['content-type'];
-    if (!contentType || !contentType.startsWith('multipart/form-data')) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        success: false,
-        error: 'Content-Type must be multipart/form-data'
-      }));
-      return;
-    }
-
-    // Upload validation constants
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-    const ALLOWED_MIME_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/bmp'];
-
-    // Set request timeout
-    req.setTimeout(30000); // 30 seconds
-
-    // Track upload state
-    let fileReceived = false;
-    let fileBuffer = [];
-    let fileSize = 0;
-    let mimeType = null;
-    let filename = null;
-    let fileCount = 0;
-    let responded = false;
-
-    // Helper function to send response safely with double-response guard
-    const sendResponse = (statusCode, body) => {
-      if (responded) return;
-      responded = true;
-      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(body));
-    };
-
-    // Helper function to halt processing after early errors
-    const haltProcessing = (errorMessage = 'Early validation failed') => {
-      try {
-        busboy.destroy(new Error(errorMessage));
-        req.unpipe(busboy);
-      } catch (e) {
-        // Ignore errors from cleanup
-      }
-    };
-
-    // Log upload start
-    logMCP('info', 'upload-start', 'File upload started', {
-      contentType: contentType,
-      contentLength: req.headers['content-length']
-    });
-
-    // Initialize busboy
-    const busboy = Busboy({ headers: req.headers });
-
-    // Handle file upload
-    busboy.on('file', (fieldname, file, info) => {
-      fileCount++;
-      
-      // Check if multiple files uploaded
-      if (fileCount > 1) {
-        logMCP('error', 'upload-validation', 'Multiple files uploaded - only one allowed', {
-          fileCount
-        });
-        file.destroy();
-        sendResponse(400, {
-          success: false,
-          error: 'Only one file allowed per upload'
-        });
-        haltProcessing('Multiple files uploaded');
-        return;
-      }
-
-      filename = info.filename;
-      mimeType = info.mimeType;
-
-      // Validate MIME type
-      if (!ALLOWED_MIME_TYPES.includes(mimeType)) {
-        logMCP('error', 'upload-validation', 'Invalid MIME type uploaded', {
-          filename,
-          mimeType,
-          allowedTypes: ALLOWED_MIME_TYPES
-        });
-        file.destroy();
-        sendResponse(400, {
-          success: false,
-          error: `Invalid file type. Allowed types: ${ALLOWED_MIME_TYPES.join(', ')}`
-        });
-        haltProcessing('Invalid MIME type');
-        return;
-      }
-
-      fileReceived = true;
-
-      // Log file start
-      logMCP('info', 'upload-file', 'File upload in progress', {
-        filename,
-        mimeType
-      });
-
-      // Stream file chunks
-      file.on('data', (data) => {
-        fileSize += data.length;
-        
-        // Check file size limit
-        if (fileSize > MAX_FILE_SIZE) {
-          logMCP('error', 'upload-validation', 'File size exceeded limit', {
-            filename,
-            fileSize,
-            maxSize: MAX_FILE_SIZE
-          });
-          file.destroy();
-          sendResponse(413, {
-            success: false,
-            error: `File too large. Maximum size: ${MAX_FILE_SIZE / (1024 * 1024)}MB`
-          });
-          haltProcessing('File size exceeded');
-          return;
-        }
-
-        fileBuffer.push(data);
-      });
-
-      file.on('end', () => {
-        logMCP('info', 'upload-chunk', 'File chunk received', {
-          filename,
-          chunkSize: fileBuffer[fileBuffer.length - 1]?.length || 0
-        });
-      });
-    });
-
-    // Handle busboy errors
-    busboy.on('error', (err) => {
-      if (responded) return; // Guard against double response
-      logMCP('error', 'upload-parse', 'Busboy parsing error', {
-        error: err.message
-      });
-      sendResponse(400, {
-        success: false,
-        error: 'Failed to parse multipart data'
-      });
-    });
-
-    // Handle upload completion
-    busboy.on('finish', () => {
-      // Guard against double response (e.g., if early error already sent response)
-      if (responded) return;
-
-      // Check if file was uploaded
-      if (!fileReceived) {
-        logMCP('error', 'upload-validation', 'No file uploaded', {});
-        sendResponse(400, {
-          success: false,
-          error: 'No file uploaded'
-        });
-        return;
-      }
-
-      try {
-        // Concatenate file buffer
-        const completeBuffer = Buffer.concat(fileBuffer);
-        
-        // Convert to base64
-        const base64Data = completeBuffer.toString('base64');
-        const dataUri = `data:${mimeType};base64,${base64Data}`;
-
-        // Log successful upload
-        logMCP('info', 'upload-success', 'File upload completed successfully', {
-          filename,
-          mimeType,
-          fileSize,
-          dataSize: base64Data.length
-        });
-
-        // Return success response
-        sendResponse(200, {
-          success: true,
-          filename,
-          mimeType,
-          size: fileSize,
-          base64: base64Data,
-          dataUri: dataUri
-        });
-
-      } catch (error) {
-        logMCP('error', 'upload-process', 'Error processing uploaded file', {
-          filename,
-          error: error.message
-        });
-        sendResponse(500, {
-          success: false,
-          error: 'Failed to process uploaded file'
-        });
-      }
-    });
-
-    // Handle request timeout
-    req.on('timeout', () => {
-      if (responded) return; // Guard against double response
-      logMCP('error', 'upload-timeout', 'Upload request timed out', {
-        filename,
-        fileSize
-      });
-      haltProcessing('Request timeout');
-      sendResponse(408, {
-        success: false,
-        error: 'Request timeout'
-      });
-    });
-
-    // Pipe request to busboy
-    req.pipe(busboy);
-    return; // Don't continue to proxy logic
   }
 
   // Collect request body for logging and validation
@@ -1052,12 +1105,34 @@ function processRequest(req, res) {
             });
           }
         } catch (error) {
-          logMCP('warn', 'file-transform', 'Error during file transformation', {
+          logMCP('error', 'file-validation', 'Invalid file path in tool arguments', {
             requestId,
             toolName,
-            error: error.message
+            error: error.message,
+            originalPath: error.originalPath,
+            parameterName: error.parameterName,
+            arrayIndex: error.arrayIndex
           });
-          // Continue with original request if transformation fails
+          
+          // Return JSON-RPC error response to client
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32602,
+              message: 'Invalid file path in tool arguments',
+              data: {
+                error: error.message,
+                toolName: toolName,
+                originalPath: error.originalPath,
+                parameterName: error.parameterName,
+                arrayIndex: error.arrayIndex,
+                hint: 'Please upload the file via POST /upload endpoint first to get a serverPath, then use that serverPath in your tool call.'
+              }
+            },
+            id: jsonBody.id || null
+          }));
+          return;
         }
       }
       
@@ -1087,7 +1162,7 @@ function processRequest(req, res) {
                 {
                   uri: 'upload://images',
                   name: 'Image Upload Endpoint',
-                  description: 'Upload local images to POST /upload endpoint for use with Z.ai Vision tools. Supports PNG, JPEG, GIF, WebP, BMP formats (max 10MB). Returns base64 encoded data for direct use in tool calls.',
+                  description: 'Upload local images to POST /upload endpoint for use with Z.ai Vision tools. Supports PNG, JPEG, GIF, WebP, BMP formats (max 10MB). Returns serverPath for direct use with vision tools.',
                   mimeType: 'application/json'
                 }
               ]
@@ -1126,15 +1201,19 @@ function processRequest(req, res) {
                   supportedFormats: ['png', 'jpeg', 'jpg', 'gif', 'webp', 'bmp'],
                   maxSize: '10MB',
                   responseFormat: {
-                    base64: 'base64 encoded image data',
-                    dataUri: 'data URI format for direct use'
+                    serverPath: 'path on remote server (e.g., /tmp/mcp-uploads/xxx.png)',
+                    filename: 'original filename',
+                    mimeType: 'image MIME type',
+                    size: 'file size in bytes'
                   },
                   usage: {
-                    curl: 'curl -X POST http://localhost:8080/upload -H "Authorization: Bearer $TOKEN" -F "file=@image.jpg"',
+                    curl: 'curl -X POST http://localhost:8080/upload -F "file=@image.jpg"',
                     response: {
                       success: true,
-                      base64: 'base64_data_here',
-                      dataUri: 'data:image/jpeg;base64,base64_data_here'
+                      serverPath: '/tmp/mcp-uploads/1234_abc_image.jpg',
+                      filename: 'image.jpg',
+                      mimeType: 'image/jpeg',
+                      size: 12345
                     }
                   }
                 }
@@ -1187,6 +1266,87 @@ function processRequest(req, res) {
               arguments: toolArgs
             });
           }
+          
+          // Handle upload_file tool - returns instructions for using the public /upload endpoint
+          // This avoids passing large base64 strings through the MCP protocol
+          if (toolName === 'upload_file') {
+            logMCP('info', 'upload-file-tool', 'upload_file tool called - returning upload instructions', {
+              requestId,
+              toolArgs
+            });
+            
+            // Get the server's base URL from request headers
+            const protocol = req.headers['x-forwarded-proto'] || 'https';
+            const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:8080';
+            const uploadUrl = `${protocol}://${host}/upload`;
+            
+            // Build response with upload instructions
+            const mcpResponse = {
+              jsonrpc: '2.0',
+              id: jsonBody.id,
+              result: {
+                content: [
+                  {
+                    type: 'text',
+                    text: `## File Upload Instructions\n\n` +
+                          `The /upload endpoint is **public** (no authentication required) to allow direct file uploads.\n\n` +
+                          `### Upload Command\n\n` +
+                          `\`\`\`bash\n` +
+                          `curl -X POST "${uploadUrl}" -F "file=@/path/to/your/image.png"\n` +
+                          `\`\`\`\n\n` +
+                          `### Response Format\n\n` +
+                          `The response will be JSON with:\n` +
+                          `- \`serverPath\`: Path on the remote server (e.g., /tmp/mcp-uploads/xxx.png)\n` +
+                          `- \`filename\`: Original filename\n` +
+                          `- \`mimeType\`: Image MIME type\n` +
+                          `- \`size\`: File size in bytes\n\n` +
+                          `### Usage with Vision Tools\n\n` +
+                          `Use the returned \`serverPath\` as the \`image_source\` parameter in vision tools:\n` +
+                          `- analyze_image\n` +
+                          `- extract_text_from_screenshot\n` +
+                          `- diagnose_error_screenshot\n` +
+                          `- understand_technical_diagram\n` +
+                          `- analyze_data_visualization\n` +
+                          `- ui_diff_check\n\n` +
+                          `### Example Workflow\n\n` +
+                          `1. Upload: \`curl -X POST "${uploadUrl}" -F "file=@screenshot.png"\`\n` +
+                          `2. Get serverPath from response: \`/tmp/mcp-uploads/1234_abc_screenshot.png\`\n` +
+                          `3. Use with vision tool: \`analyze_image(image_source="/tmp/mcp-uploads/1234_abc_screenshot.png", ...)\``
+                  }
+                ]
+              }
+            };
+            
+            // Extract sessionId from URL to find the SSE connection
+            const urlParams = new URL(req.url, `http://localhost`).searchParams;
+            const sessionId = urlParams.get('sessionId');
+            
+            if (sessionId && gatewayState.sseSessions.has(sessionId)) {
+              // Send response through SSE stream using safe write
+              safeSSEWrite(sessionId, `event: message\ndata: ${JSON.stringify(mcpResponse)}\n\n`);
+              
+              // Send 202 Accepted as HTTP response
+              res.writeHead(202, { 'Content-Type': 'text/plain' });
+              res.end('Accepted');
+              
+              logMCP('info', 'upload-file-sse', 'Upload instructions sent through SSE stream', {
+                requestId,
+                sessionId,
+                uploadUrl
+              });
+            } else {
+              // Fallback to direct HTTP response (for non-SSE clients)
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(mcpResponse));
+              
+              logMCP('info', 'upload-file-http', 'Upload instructions sent via HTTP (no SSE session)', {
+                requestId,
+                sessionId: sessionId || 'none',
+                uploadUrl
+              });
+            }
+            return;
+          }
         }
       }
     }
@@ -1206,7 +1366,7 @@ function processRequest(req, res) {
       // No timeout for SSE requests - they're meant to stay open indefinitely
       timeout: isSSE ? 0 : PROXY_TIMEOUT_MS
     }, (proxyRes) => {
-      // For SSE requests, stream the response directly without buffering
+      // For SSE requests, intercept and potentially modify tools/list responses
       if (isSSE) {
         logMCP('info', 'sse-stream', 'Starting SSE stream proxy', {
           requestId,
@@ -1217,12 +1377,169 @@ function processRequest(req, res) {
         // Forward headers immediately
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         
-        // Stream data directly to client as it arrives
+        // Track this SSE connection for sending responses
+        let currentSessionId = null;
+        
+        // Buffer for incomplete SSE events
+        let sseBuffer = '';
+        
+        // Vision tool names for detection
+        const visionToolNames = [
+          'ui_to_artifact', 'extract_text_from_screenshot', 'analyze_image',
+          'diagnose_error_screenshot', 'analyze_data_visualization', 'understand_technical_diagram',
+          'ui_diff_check', 'analyze_video'
+        ];
+        
+        // Process SSE events to inject upload_file tool
+        const processSSEChunk = (chunk) => {
+          sseBuffer += chunk.toString();
+          
+          // SSE events are separated by double newlines
+          const events = sseBuffer.split('\n\n');
+          
+          // Keep the last incomplete event in the buffer
+          sseBuffer = events.pop() || '';
+          
+          let output = '';
+          
+          for (const event of events) {
+            if (!event.trim()) {
+              output += '\n\n';
+              continue;
+            }
+            
+            // Parse SSE event
+            const lines = event.split('\n');
+            let eventType = '';
+            let eventData = '';
+            
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventType = line.substring(6).trim();
+              } else if (line.startsWith('data:')) {
+                eventData = line.substring(5).trim();
+              }
+            }
+            
+            // Log all parsed events for debugging
+            logMCP('info', 'sse-event-parsed', 'Parsed SSE event', {
+              requestId,
+              eventType: eventType || '(empty)',
+              eventDataPreview: eventData ? eventData.substring(0, 200) : '(empty)',
+              hasEndpoint: eventType === 'endpoint'
+            });
+            
+            // Check if this is an endpoint event (contains session ID)
+            if (eventType === 'endpoint' && eventData) {
+              // Extract session ID from endpoint data like "/message?sessionId=xxx"
+              const sessionMatch = eventData.match(/sessionId=([^&\s]+)/);
+              if (sessionMatch) {
+                currentSessionId = sessionMatch[1];
+                // Store this SSE connection for the session with keepalive support
+                gatewayState.sseSessions.set(currentSessionId, {
+                  res: res,
+                  alive: true,
+                  keepaliveInterval: null
+                });
+                // Start keepalive for this session
+                startSSEKeepalive(currentSessionId);
+                logMCP('info', 'sse-session-track', 'Tracking SSE session', {
+                  requestId,
+                  sessionId: currentSessionId
+                });
+              }
+            }
+            
+            // Check if this is a tools/list response
+            if (eventData) {
+              try {
+                const parsed = JSON.parse(eventData);
+                
+                // Check if this is a tools/list response with tools array
+                if (parsed.result && Array.isArray(parsed.result.tools)) {
+                  const hasVisionTools = parsed.result.tools.some(tool => 
+                    visionToolNames.includes(tool.name)
+                  );
+                  
+                  if (hasVisionTools) {
+                    logMCP('info', 'sse-tools-enhance', 'Enhancing tools/list response in SSE stream', {
+                      requestId,
+                      toolCount: parsed.result.tools.length
+                    });
+                    
+                    // Add upload_file tool - returns instructions for using the public /upload endpoint
+                    const uploadFileTool = {
+                      name: 'upload_file',
+                      description: 'Get instructions for uploading images to the remote MCP server. This tool returns curl commands to upload files via the PUBLIC /upload endpoint (no authentication required).\n\n**WORKFLOW FOR AI AGENTS:**\n1. Call this tool to get the upload URL and instructions\n2. Use execute_command with curl to upload the file: `curl -X POST <url>/upload -F "file=@/path/to/image.png"`\n3. Parse the JSON response to get the serverPath\n4. Use the serverPath directly with vision tools like analyze_image\n\n**Note:** The /upload endpoint is intentionally public to allow direct file uploads. Use the returned serverPath (e.g., /tmp/mcp-uploads/xxx.png) directly - no base64 conversion needed.',
+                      inputSchema: {
+                        type: 'object',
+                        properties: {},
+                        required: []
+                      }
+                    };
+                    
+                    parsed.result.tools.unshift(uploadFileTool);
+                    
+                    // Enhance vision tool descriptions
+                    parsed.result.tools.forEach(tool => {
+                      if (visionToolNames.includes(tool.name)) {
+                        if (tool.description) {
+                          tool.description += '\n\n**REMOTE SERVER USAGE:** This MCP server runs remotely on Fly.io. Local file paths will NOT work. To analyze local images:\n1. First upload your local image via POST /upload endpoint\n2. Use the returned serverPath (e.g., /tmp/mcp-uploads/xxx.png) directly as the image_source parameter';
+                        }
+                      }
+                    });
+                    
+                    eventData = JSON.stringify(parsed);
+                    
+                    logMCP('info', 'sse-tools-enhanced', 'Successfully enhanced tools/list in SSE', {
+                      requestId,
+                      totalTools: parsed.result.tools.length,
+                      uploadFileAdded: true
+                    });
+                  }
+                }
+              } catch (e) {
+                // Not valid JSON or parsing failed, pass through unchanged
+              }
+            }
+            
+            // Reconstruct the SSE event
+            if (eventType) {
+              output += `event: ${eventType}\n`;
+            }
+            if (eventData) {
+              output += `data: ${eventData}\n`;
+            }
+            output += '\n';
+          }
+          
+          return output;
+        };
+        
+        // Stream data with SSE event processing
         proxyRes.on('data', (chunk) => {
-          res.write(chunk);
+          // Log raw SSE chunk for debugging
+          logMCP('info', 'sse-raw-chunk', 'Raw SSE chunk received', {
+            requestId,
+            chunkLength: chunk.length,
+            chunkPreview: chunk.toString().substring(0, 500)
+          });
+          
+          const processed = processSSEChunk(chunk);
+          if (processed) {
+            res.write(processed);
+          }
         });
         
         proxyRes.on('end', () => {
+          // Flush any remaining buffer
+          if (sseBuffer.trim()) {
+            res.write(sseBuffer);
+          }
+          // Clean up session tracking
+          if (currentSessionId) {
+            cleanupSSESession(currentSessionId);
+          }
           logMCP('info', 'sse-end', 'SSE stream ended', { requestId });
           res.end();
         });
@@ -1282,37 +1599,38 @@ function processRequest(req, res) {
               );
               
               if (hasVisionTools) {
+                // Add upload_file tool - returns instructions for using the public /upload endpoint
+                const uploadFileTool = {
+                  name: 'upload_file',
+                  description: 'Get instructions for uploading images to the remote MCP server. This tool returns curl commands to upload files via the PUBLIC /upload endpoint (no authentication required).\n\n**WORKFLOW FOR AI AGENTS:**\n1. Call this tool to get the upload URL and instructions\n2. Use execute_command with curl to upload the file: `curl -X POST <url>/upload -F "file=@/path/to/image.png"`\n3. Parse the JSON response to get the serverPath\n4. Use the serverPath directly with vision tools like analyze_image\n\n**Note:** The /upload endpoint is intentionally public to allow direct file uploads. Use the returned serverPath (e.g., /tmp/mcp-uploads/xxx.png) directly - no base64 conversion needed.',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {},
+                    required: []
+                  }
+                };
+                
+                // Add upload_file tool to beginning of tools list
+                responseJson.result.tools.unshift(uploadFileTool);
+                
                 // Enhance tool descriptions for vision tools
                 responseJson.result.tools.forEach(tool => {
                   if (visionToolNames.includes(tool.name)) {
                     // Add upload capability hint to description
                     if (tool.description) {
-                      tool.description += '\n\n**Note for remote servers**: Local image files are automatically converted to base64. You can also upload files to POST /upload endpoint first.';
-                    }
-                    
-                    // Update inputSchema descriptions for image path parameters
-                    if (tool.inputSchema && tool.inputSchema.properties) {
-                      Object.keys(tool.inputSchema.properties).forEach(paramName => {
-                        const param = tool.inputSchema.properties[paramName];
-                        if (param.description && (
-                            param.description.toLowerCase().includes('image') ||
-                            param.description.toLowerCase().includes('file') ||
-                            param.description.toLowerCase().includes('path') ||
-                            param.type === 'string'
-                          )) {
-                          param.description += ' (Local file paths are automatically converted to base64 for Z.ai Vision tools)';
-                        }
-                      });
+                      tool.description += '\n\n**REMOTE SERVER USAGE:** This MCP server runs remotely on Fly.io. Local file paths will NOT work. To analyze local images:\n1. First upload your local image via POST /upload endpoint\n2. Use the returned serverPath (e.g., /tmp/mcp-uploads/xxx.png) directly as the image_source parameter';
                     }
                   }
                 });
                 
-                // Re-serialize the enhanced response
+                // Re-serialize enhanced response
                 responseBody = JSON.stringify(responseJson);
                 
-                logMCP('info', 'tools-enhanced', 'Successfully enhanced tools/list response', {
+                logMCP('info', 'tools-enhanced', 'Successfully enhanced tools/list response with upload_file tool', {
                   requestId,
-                  enhancedTools: responseJson.result.tools.filter(tool => 
+                  totalTools: responseJson.result.tools.length,
+                  uploadFileAdded: true,
+                  enhancedVisionTools: responseJson.result.tools.filter(tool => 
                     visionToolNames.includes(tool.name)
                   ).length
                 });

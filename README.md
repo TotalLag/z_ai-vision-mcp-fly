@@ -53,7 +53,7 @@ The proxy will start on port 8080 and spawn the Z.AI Vision MCP Server via super
 ## Architecture
 
 ```
-Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Server (stdio) → Z.AI API
+Client → Z.AI Vision MCP Proxy (8080) → [Upload: /tmp/mcp-uploads/] → Supergateway (8000) → Z.AI MCP Server (stdio) → Z.AI API
 ```
 
 ### Component Details
@@ -61,7 +61,7 @@ Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Ser
 - **Z.AI Vision MCP Proxy**: HTTP server with bearer auth, request routing, and SSE streaming
 - **Supergateway**: Bridges HTTP/SSE to stdio for MCP protocol communication
 - **Z.AI Vision MCP Server**: Vision AI capabilities via the Z.AI platform
-- **Automatic File Transformation**: Converts local file paths to base64 for Z.ai Vision tools
+- **File Upload Endpoint**: Accepts multipart file uploads, stores in `/tmp/mcp-uploads/`, returns serverPath for tool calls
 - **MCP Resource Discovery**: Provides capability discovery for AI agents
 
 ## Configuration Summary
@@ -80,11 +80,30 @@ Client → Z.AI Vision MCP Proxy (8080) → Supergateway (8000) → Z.AI MCP Ser
 
 ### Agent Integration & Resource Discovery
 
-This server implements MCP (Model Context Protocol) resource discovery to help AI agents understand available capabilities and automatically handle local file paths for Z.ai Vision tools.
+This server implements MCP (Model Context Protocol) resource discovery to help AI agents understand available capabilities.
 
-#### Automatic File Handling
+#### File Upload for Large Images
 
-Local file paths in Z.ai Vision tool calls are automatically converted to base64 format before being sent to the MCP gateway. This allows agents to use local file paths seamlessly without manual conversion.
+**Important:** Base64 encoding increases file size by ~33% (e.g., 8MB → 11MB JSON payload), which can cause HTTP timeouts, JSON parsing failures, and memory issues. For large images, the proxy uses an upload-only approach:
+
+- Files must be uploaded via `POST /upload` endpoint first
+- Uploaded files are stored in `/tmp/mcp-uploads/` and referenced by `serverPath`
+- Use the `serverPath` directly in Z.AI Vision tool calls
+- **Maximum file size:** 10MB per upload
+- **Supported formats:** PNG, JPEG, GIF, WebP, BMP
+
+This approach ensures reliable handling of large images without the overhead and limitations of base64 encoding.
+
+#### Upload-Only Workflow
+
+**Local file paths are NOT automatically converted to base64.** Instead, agents must upload files via the `POST /upload` endpoint first:
+
+1. Upload local image via `POST /upload` endpoint
+2. Receive `serverPath` in response (e.g., `/tmp/mcp-uploads/123_abc_image.png`)
+3. Use the `serverPath` directly in Z.AI Vision tool calls
+4. No base64 conversion happens during tool execution
+
+This approach ensures reliable handling of large images and eliminates base64 size overhead.
 
 #### Resource Discovery Protocol
 
@@ -103,13 +122,17 @@ sequenceDiagram
     participant Gateway as Supergateway
     participant Vision as Z.AI Vision MCP
     
-    Note over Agent,Vision: Resource Discovery Phase
+    Note over Agent,Vision: Phase 1: Resource Discovery
     Agent->>Proxy: resources/list
     Proxy-->>Agent: upload://images resource
     Agent->>Proxy: resources/read(upload://images)
     Proxy-->>Agent: Upload endpoint details
     
-    Note over Agent,Vision: Tool Discovery Phase
+    Note over Agent,Vision: Phase 2: File Upload
+    Agent->>Proxy: POST /upload (file)
+    Proxy-->>Agent: serverPath
+    
+    Note over Agent,Vision: Phase 3: Tool Discovery
     Agent->>Proxy: tools/list
     Proxy->>Gateway: tools/list
     Gateway->>Vision: tools/list
@@ -118,10 +141,9 @@ sequenceDiagram
     Proxy->>Proxy: Enhance descriptions
     Proxy-->>Agent: Enhanced tool definitions
     
-    Note over Agent,Vision: Tool Execution Phase
-    Agent->>Proxy: tools/call(local_path)
-    Proxy->>Proxy: Transform to base64
-    Proxy->>Gateway: tools/call(base64)
+    Note over Agent,Vision: Phase 4: Tool Execution
+    Agent->>Proxy: tools/call(serverPath)
+    Proxy->>Gateway: tools/call(serverPath)
     Gateway->>Vision: Execute tool
     Vision-->>Gateway: Result
     Gateway-->>Proxy: Result
@@ -132,10 +154,10 @@ sequenceDiagram
 
 AI agents should implement this workflow:
 
-1. **On Connection**: Query `resources/list` to discover available capabilities
+1. **On Connection**: Query `resources/list` to discover upload capability
 2. **Read Upload Details**: Use `resources/read` with `uri: "upload://images"` to get upload instructions
-3. **Trust Automatic Transformation**: Use local file paths in Z.ai Vision tool calls - they will be automatically converted
-4. **Optional Explicit Upload**: Use POST `/upload` for explicit file uploads if needed
+3. **Upload Files**: Use `POST /upload` to upload local images, receive `serverPath`
+4. **Use serverPath**: Pass `serverPath` directly to Z.AI Vision tools (no base64 needed)
 
 #### Testing Resource Discovery
 
@@ -154,6 +176,37 @@ curl -X POST http://localhost:8080/sse \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"upload://images"},"id":2}'
 ```
+
+#### Example: Upload and Analyze Workflow
+
+```bash
+# Step 1: Upload local image
+curl -X POST https://your-app.fly.dev/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/path/to/large-screenshot.png"
+
+# Response: {"success": true, "serverPath": "/tmp/mcp-uploads/123_abc_large-screenshot.png", ...}
+
+# Step 2: Use serverPath in tool call
+curl -X POST https://your-app.fly.dev/sse \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"analyze_image","arguments":{"image_path":"/tmp/mcp-uploads/123_abc_large-screenshot.png"}},"id":3}'
+```
+
+#### File Size Recommendations
+
+| Image Size | Recommendation | Reason |
+|------------|----------------|--------|
+| < 1MB | Optimal | Fast upload, quick processing |
+| 1-5MB | Good | Reasonable upload time |
+| 5-10MB | Maximum | Supported but slower |
+| > 10MB | Not Supported | Exceeds upload limit |
+
+**Tips:**
+- Compress images before uploading when possible
+- Use appropriate image formats (JPEG for photos, PNG for screenshots)
+- Consider resizing very large images to reduce file size
 
 ### `GET /sse`
 SSE endpoint for MCP protocol communication (requires bearer token in production)
@@ -384,6 +437,28 @@ curl -v http://localhost:8080/health
 - Confirm the original request was for 'tools/list'
 - Check for 'tools-enhance' log entries
 - Verify the response contains Z.ai Vision tools
+
+### Large Image Upload Issues
+
+**"Upload fails with 413 Payload Too Large"**
+- File exceeds 10MB limit
+- Compress or resize the image before uploading
+- Check file size: `ls -lh /path/to/image.png`
+
+**"Tool call fails with 'Upload via POST /upload first'"**
+- You're passing a local file path instead of a serverPath
+- Upload the file first via `POST /upload`
+- Use the returned `serverPath` in your tool call
+
+**"Upload succeeds but tool call fails to find file"**
+- Verify the `serverPath` matches exactly what was returned from upload
+- Check server logs for file access errors
+- Ensure the file wasn't cleaned up (files persist for the session)
+
+**"Image analysis times out"**
+- Very large images (8-10MB) may take longer to process
+- Consider resizing images to 2-5MB for faster results
+- Check Z.AI API status if timeouts persist
 
 ## License
 
